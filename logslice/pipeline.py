@@ -1,90 +1,85 @@
-"""High-level pipeline that wires together filtering, context, and stats."""
+"""Core pipeline: wire together filter, time-range, context, and dedup."""
 
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, List, Optional
 
 from logslice.extractor import extract_timestamp
 from logslice.filter import compile_pattern, filter_lines
-from logslice.context import lines_with_context
 from logslice.time_range import parse_range, within_range
-from logslice.stats import FilterStats, collect_stats
+from logslice.context import lines_with_context
+from logslice.dedup import deduplicate
+
+
+def _is_match(
+    line: str,
+    pattern=None,
+    time_range=None,
+) -> bool:
+    """Return True when *line* satisfies all active filters."""
+    if pattern is not None and not pattern.search(line):
+        return False
+    if time_range is not None:
+        ts = extract_timestamp(line)
+        if ts is None or not within_range(ts, time_range):
+            return False
+    return True
 
 
 def run_pipeline(
-    raw_lines: list[str],
-    *,
+    lines: Iterable[str],
     pattern: Optional[str] = None,
-    time_range: Optional[str] = None,
+    time_range_str: Optional[str] = None,
     before_context: int = 0,
     after_context: int = 0,
-    ignore_case: bool = False,
-) -> tuple[list[str], FilterStats]:
-    """Filter *raw_lines* and return (result_lines, stats).
+    dedup: bool = False,
+    dedup_ignore_timestamps: bool = False,
+    dedup_max_seen: Optional[int] = None,
+) -> Iterator[str]:
+    """Run the full log-processing pipeline.
 
-    Parameters
-    ----------
-    raw_lines:
-        All log lines to process.
-    pattern:
-        Optional regex pattern to match against each line.
-    time_range:
-        Optional time range string understood by :func:`parse_range`.
-    before_context:
-        Number of lines to include before each match.
-    after_context:
-        Number of lines to include after each match.
-    ignore_case:
-        Whether regex matching should be case-insensitive.
+    Steps (in order):
+      1. Compile regex pattern (if provided).
+      2. Parse time range (if provided).
+      3. Filter lines using pattern + time range.
+      4. Expand with before/after context lines.
+      5. Optionally deduplicate output.
+
+    Args:
+        lines: Raw input lines.
+        pattern: Optional regex string.
+        time_range_str: Optional time range like ``start,end``.
+        before_context: Number of lines to include before each match.
+        after_context: Number of lines to include after each match.
+        dedup: If True, deduplicate output lines.
+        dedup_ignore_timestamps: Passed to :func:`deduplicate`.
+        dedup_max_seen: Passed to :func:`deduplicate`.
+
+    Yields:
+        Processed log lines.
     """
-    compiled = compile_pattern(pattern, ignore_case=ignore_case) if pattern else None
-    time_rng = parse_range(time_range) if time_range else None
+    compiled = compile_pattern(pattern) if pattern else None
+    tr = parse_range(time_range_str) if time_range_str else None
 
-    time_filtered = 0
-    pattern_filtered = 0
-    parse_errors = 0
-    candidate_lines: list[str] = []
+    def match_fn(line: str) -> bool:
+        return _is_match(line, pattern=compiled, time_range=tr)
 
-    for line in raw_lines:
-        # --- time range filter ---
-        if time_rng is not None:
-            ts = extract_timestamp(line)
-            if ts is None:
-                parse_errors += 1
-            elif not within_range(ts, time_rng):
-                time_filtered += 1
-                continue
+    buffered: List[str] = list(lines)
 
-        candidate_lines.append(line)
-
-    # --- pattern filter ---
-    if compiled is not None:
-        filtered = list(filter_lines(candidate_lines, compiled))
-        pattern_filtered = len(candidate_lines) - len(filtered)
-    else:
-        filtered = candidate_lines
-
-    # --- context expansion ---
-    def _is_match(line: str) -> bool:
-        if compiled is None:
-            return True
-        return compiled.search(line) is not None
-
+    result: Iterable[str]
     if before_context > 0 or after_context > 0:
-        result = list(
-            lines_with_context(
-                candidate_lines,
-                _is_match,
-                before=before_context,
-                after=after_context,
-            )
+        result = lines_with_context(
+            buffered,
+            match_fn,
+            before=before_context,
+            after=after_context,
         )
     else:
-        result = filtered
+        result = (line for line in buffered if match_fn(line))
 
-    stats = collect_stats(
-        raw_lines,
-        result,
-        time_filtered=time_filtered,
-        pattern_filtered=pattern_filtered,
-        parse_errors=parse_errors,
-    )
-    return result, stats
+    if dedup:
+        result = deduplicate(
+            result,
+            ignore_timestamps=dedup_ignore_timestamps,
+            max_seen=dedup_max_seen,
+        )
+
+    yield from result
