@@ -1,85 +1,82 @@
-"""Core pipeline: wire together filter, time-range, context, and dedup."""
+"""Pipeline: compose filter, dedup, rate-limit, tail, and sample steps."""
 
+from __future__ import annotations
+
+import re
 from typing import Iterable, Iterator, List, Optional
 
 from logslice.extractor import extract_timestamp
-from logslice.filter import compile_pattern, filter_lines
-from logslice.time_range import parse_range, within_range
-from logslice.context import lines_with_context
-from logslice.dedup import deduplicate
+from logslice.time_range import within_range
 
 
 def _is_match(
     line: str,
-    pattern=None,
+    pattern: Optional[re.Pattern],
     time_range=None,
 ) -> bool:
-    """Return True when *line* satisfies all active filters."""
     if pattern is not None and not pattern.search(line):
         return False
     if time_range is not None:
         ts = extract_timestamp(line)
-        if ts is None or not within_range(ts, time_range):
+        if ts is not None and not within_range(ts, time_range):
             return False
     return True
 
 
 def run_pipeline(
     lines: Iterable[str],
-    pattern: Optional[str] = None,
-    time_range_str: Optional[str] = None,
-    before_context: int = 0,
-    after_context: int = 0,
+    pattern: Optional[re.Pattern] = None,
+    time_range=None,
     dedup: bool = False,
-    dedup_ignore_timestamps: bool = False,
-    dedup_max_seen: Optional[int] = None,
+    ignore_timestamps: bool = False,
+    max_per_bucket: Optional[int] = None,
+    bucket_seconds: int = 60,
+    tail: Optional[int] = None,
+    head: Optional[int] = None,
+    sample_rate: Optional[float] = None,
+    every_nth: Optional[int] = None,
+    max_length: Optional[int] = None,
 ) -> Iterator[str]:
-    """Run the full log-processing pipeline.
+    """Run lines through the full processing pipeline."""
+    from logslice.dedup import deduplicate
+    from logslice.rate import rate_limit
+    from logslice.tail import tail_lines, head_lines
+    from logslice.sample import sample_by_rate, every_nth as every_nth_fn
+    from logslice.truncate import truncate_lines
 
-    Steps (in order):
-      1. Compile regex pattern (if provided).
-      2. Parse time range (if provided).
-      3. Filter lines using pattern + time range.
-      4. Expand with before/after context lines.
-      5. Optionally deduplicate output.
-
-    Args:
-        lines: Raw input lines.
-        pattern: Optional regex string.
-        time_range_str: Optional time range like ``start,end``.
-        before_context: Number of lines to include before each match.
-        after_context: Number of lines to include after each match.
-        dedup: If True, deduplicate output lines.
-        dedup_ignore_timestamps: Passed to :func:`deduplicate`.
-        dedup_max_seen: Passed to :func:`deduplicate`.
-
-    Yields:
-        Processed log lines.
-    """
-    compiled = compile_pattern(pattern) if pattern else None
-    tr = parse_range(time_range_str) if time_range_str else None
-
-    def match_fn(line: str) -> bool:
-        return _is_match(line, pattern=compiled, time_range=tr)
-
-    buffered: List[str] = list(lines)
-
-    result: Iterable[str]
-    if before_context > 0 or after_context > 0:
-        result = lines_with_context(
-            buffered,
-            match_fn,
-            before=before_context,
-            after=after_context,
-        )
-    else:
-        result = (line for line in buffered if match_fn(line))
+    matched: Iterable[str] = (
+        line for line in lines if _is_match(line, pattern, time_range)
+    )
 
     if dedup:
-        result = deduplicate(
-            result,
-            ignore_timestamps=dedup_ignore_timestamps,
-            max_seen=dedup_max_seen,
-        )
+        matched = deduplicate(matched, ignore_timestamps=ignore_timestamps)
 
-    yield from result
+    if max_per_bucket is not None:
+        matched = rate_limit(matched, max_per_bucket, bucket_seconds)
+
+    result: List[str] = list(matched)
+
+    if head is not None and (head > 0):
+        result = head_lines(result, head)
+    elif tail is not None and (tail > 0):
+        result = tail_lines(result, tail)
+
+    if sample_rate is not None:
+        result = list(sample_by_rate(result, sample_rate))
+    elif every_nth is not None:
+        result = list(every_nth_fn(result, every_nth))
+
+    if max_length is not None:
+        result = list(truncate_lines(result, max_length))
+
+    return iter(result)
+
+
+def match_fn(
+    pattern: Optional[re.Pattern] = None,
+    time_range=None,
+):
+    """Return a predicate that tests a single line."""
+    def _fn(line: str) -> bool:
+        return _is_match(line, pattern, time_range)
+    return _fn
